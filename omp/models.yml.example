@@ -1,0 +1,54 @@
+# ~/.omp/agent/models.yml — Alibaba Token Plan chat provider
+#
+# Append to your existing models.yml, or use this as the full file if you have
+# no other custom providers. The apiKey field is an env-var name (not the key
+# itself); put the actual key in ~/.omp/agent/.env as ALIBABA_TOKEN_PLAN_API_KEY.
+
+providers:
+  alibaba-token-plan:
+    # Alibaba Cloud Bailian (Model Studio) — Token Plan subscription
+    # OpenAI-compatible mode endpoint, Singapore (ap-southeast-1)
+    baseUrl: https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1
+    api: openai-completions
+    apiKey: ALIBABA_TOKEN_PLAN_API_KEY   # env-var name; resolved from ~/.omp/agent/.env
+    authHeader: true                     # inject as Authorization: Bearer <key>
+    models:
+      # --- Qwen3 chat family ---
+      - id: qwen3.8-max-preview
+        name: Qwen3.8 Max (Preview)
+        reasoning: true
+        input: [text]
+        contextWindow: 1000000
+        maxTokens: 16384
+      - id: qwen3.7-max
+        name: Qwen3.7 Max
+        reasoning: true
+        input: [text]
+        contextWindow: 1000000
+        maxTokens: 16384
+      - id: qwen3.7-plus
+        name: Qwen3.7 Plus
+        reasoning: true
+        input: [text]
+        contextWindow: 131072
+        maxTokens: 16384
+      - id: qwen3.6-flash
+        name: Qwen3.6 Flash
+        reasoning: true
+        input: [text]
+        contextWindow: 131072
+        maxTokens: 16384
+      # --- GLM chat ---
+      - id: glm-5.2
+        name: GLM 5.2
+        reasoning: true
+        input: [text]
+        contextWindow: 131072
+        maxTokens: 16384
+      # --- DeepSeek chat ---
+      - id: deepseek-v4-pro
+        name: DeepSeek V4 Pro
+        reasoning: true
+        input: [text]
+        contextWindow: 131072
+        maxTokens: 16384

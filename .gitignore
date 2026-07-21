@@ -1,0 +1,16 @@
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+
+# Test artifacts (in case anyone runs the CLI from this checkout)
+maas-output/
+*.mp4
+*.png
+!docs/**/*.png
+
+# Local secrets — never commit
+.env
+*.key

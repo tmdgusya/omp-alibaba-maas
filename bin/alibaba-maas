@@ -1,0 +1,375 @@
+#!/usr/bin/env python3
+"""
+alibaba-maas — CLI wrapper for Alibaba Cloud Bailian (Model Studio) Token Plan.
+
+Covers:
+  - wan2.7-image / wan2.7-image-pro  (text-to-image, image editing; sync mode)
+  - happyhorse-1.1-t2v               (text-to-video; async + poll)
+  - happyhorse-1.1-i2v               (image-to-video; async + poll)
+  - happyhorse-1.1-r2v               (reference-to-video; async + poll)
+
+API key resolution (first match wins):
+  1. $ALIBABA_TOKEN_PLAN_API_KEY
+  2. ~/.omp/agent/.env  (the omp personal env file)
+  3. --api-key flag
+
+Endpoint base host: token-plan.ap-southeast-1.maas.aliyuncs.com  (Singapore)
+
+Docs:
+  https://help.aliyun.com/zh/model-studio/wan-image-generation-and-editing-api-reference
+  https://help.aliyun.com/zh/model-studio/happyhorse-image-to-video-api-reference
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.request
+import urllib.error
+from pathlib import Path
+
+HOST = "https://token-plan.ap-southeast-1.maas.aliyuncs.com"
+DEFAULT_IMAGE_MODEL = "wan2.7-image"
+DEFAULT_VIDEO_MODEL = "happyhorse-1.1-t2v"
+DEFAULT_I2V_MODEL = "happyhorse-1.1-i2v"
+DEFAULT_R2V_MODEL = "happyhorse-1.1-r2v"
+
+
+# ---------- key resolution ----------------------------------------------------
+def load_dotenv(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        if k.strip() == "ALIBABA_TOKEN_PLAN_API_KEY":
+            return v.strip().strip("'\"")
+    return None
+
+
+def resolve_key(flag_key: str | None) -> str:
+    if flag_key:
+        return flag_key
+    env_val = os.environ.get("ALIBABA_TOKEN_PLAN_API_KEY")
+    if env_val:
+        return env_val
+    omp_env = Path.home() / ".omp" / "agent" / ".env"
+    val = load_dotenv(omp_env)
+    if val:
+        return val
+    sys.exit(
+        "error: no API key. Set $ALIBABA_TOKEN_PLAN_API_KEY, populate "
+        "~/.omp/agent/.env, or pass --api-key."
+    )
+
+
+# ---------- http --------------------------------------------------------------
+def post_json(url: str, key: str, body: dict, async_mode: bool, timeout: int = 180) -> dict:
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    }
+    if async_mode:
+        headers["X-DashScope-Async"] = "enable"
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        sys.exit(
+            f"HTTP {e.code} from {url}\n{e.read().decode('utf-8', 'replace')}"
+        )
+
+
+def get_json(url: str, key: str, timeout: int = 60) -> dict:
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {key}"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        sys.exit(f"HTTP {e.code} from {url}\n{e.read().decode('utf-8', 'replace')}")
+
+
+def download(url: str, dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with urllib.request.urlopen(url) as r, open(dest, "wb") as f:
+        f.write(r.read())
+
+
+# ---------- commands ----------------------------------------------------------
+def cmd_image(args: argparse.Namespace) -> None:
+    key = resolve_key(args.api_key)
+    content: list[dict] = []
+    if args.image:
+        for u in args.image:
+            content.append({"image": u})
+    content.append({"text": " ".join(args.prompt)})
+    body = {
+        "model": args.model,
+        "input": {"messages": [{"role": "user", "content": content}]},
+        "parameters": {
+            "size": args.size,
+            "n": args.n,
+            "watermark": args.watermark,
+            "thinking_mode": not args.no_thinking,
+        },
+    }
+    if args.seed is not None:
+        body["parameters"]["seed"] = args.seed
+    if args.color_palette:
+        body["parameters"]["color_palette"] = [
+            {"hex": h, "ratio": r} for h, r in (p.split("/") for p in args.color_palette)
+        ]
+    if args.sequential:
+        body["parameters"]["enable_sequential"] = True
+
+    url = f"{HOST}/api/v1/services/aigc/multimodal-generation/generation"
+    print(f"[post] {url}  model={args.model} size={args.size} n={args.n}", file=sys.stderr)
+    t0 = time.time()
+    resp = post_json(url, key, body, async_mode=False, timeout=300)
+    elapsed = time.time() - t0
+
+    if "code" in resp:
+        sys.exit(f"error: {resp.get('code')}: {resp.get('message')}")
+
+    images = []
+    for choice in resp.get("output", {}).get("choices", []):
+        for c in choice.get("message", {}).get("content", []):
+            if c.get("type") == "image" and c.get("image"):
+                images.append(c["image"])
+
+    print(f"[ok ] {len(images)} image(s) in {elapsed:.1f}s", file=sys.stderr)
+    for i, img_url in enumerate(images):
+        print(img_url)
+        if not args.no_download:
+            out = args.out or Path(f"maas-output/image_{int(time.time())}_{i}.png")
+            download(img_url, out)
+            print(f"[save] {out}", file=sys.stderr)
+
+
+def submit_video(key: str, body: dict) -> str:
+    url = f"{HOST}/api/v1/services/aigc/video-generation/video-synthesis"
+    print(f"[post] {url}  model={body['model']}", file=sys.stderr)
+    resp = post_json(url, key, body, async_mode=True, timeout=60)
+    if "code" in resp:
+        sys.exit(f"error: {resp.get('code')}: {resp.get('message')}")
+    task_id = resp.get("output", {}).get("task_id")
+    if not task_id:
+        sys.exit(f"error: no task_id in response: {resp}")
+    print(f"[task] {task_id}  status={resp['output'].get('task_status')}", file=sys.stderr)
+    return task_id
+
+
+def poll_task(key: str, task_id: str, interval: int = 15, max_wait: int = 600) -> dict:
+    url = f"{HOST}/api/v1/tasks/{task_id}"
+    deadline = time.time() + max_wait
+    last = None
+    while time.time() < deadline:
+        r = get_json(url, key)
+        out = r.get("output", {})
+        status = out.get("task_status")
+        if status != last:
+            print(f"[poll] {status}", file=sys.stderr)
+            last = status
+        if status in ("SUCCEEDED", "FAILED", "CANCELED", "UNKNOWN"):
+            return r
+        time.sleep(interval)
+    sys.exit(f"error: timed out after {max_wait}s (last status={last})")
+
+
+def cmd_t2v(args: argparse.Namespace) -> None:
+    key = resolve_key(args.api_key)
+    body = {
+        "model": args.model,
+        "input": {"prompt": " ".join(args.prompt)},
+        "parameters": {"resolution": args.resolution, "duration": args.duration,
+                       "watermark": args.watermark},
+    }
+    if args.seed is not None:
+        body["parameters"]["seed"] = args.seed
+    if args.ratio:
+        body["parameters"]["ratio"] = args.ratio
+    task_id = submit_video(key, body)
+    if args.fire_and_forget:
+        print(task_id)
+        return
+    r = poll_task(key, task_id, interval=args.interval, max_wait=args.max_wait)
+    video_url = r.get("output", {}).get("video_url")
+    if not video_url:
+        sys.exit(f"error: task did not produce video_url: {r}")
+    print(video_url)
+    if not args.no_download:
+        out = args.out or Path(f"maas-output/video_{int(time.time())}.mp4")
+        download(video_url, out)
+        print(f"[save] {out}", file=sys.stderr)
+
+
+def cmd_i2v(args: argparse.Namespace) -> None:
+    key = resolve_key(args.api_key)
+    body = {
+        "model": args.model,
+        "input": {
+            "prompt": " ".join(args.prompt),
+            "media": [{"type": "first_frame", "url": args.frame}],
+        },
+        "parameters": {"resolution": args.resolution, "duration": args.duration,
+                       "watermark": args.watermark},
+    }
+    if args.seed is not None:
+        body["parameters"]["seed"] = args.seed
+    task_id = submit_video(key, body)
+    if args.fire_and_forget:
+        print(task_id)
+        return
+    r = poll_task(key, task_id, interval=args.interval, max_wait=args.max_wait)
+    video_url = r.get("output", {}).get("video_url")
+    if not video_url:
+        sys.exit(f"error: task did not produce video_url: {r}")
+    print(video_url)
+    if not args.no_download:
+        out = args.out or Path(f"maas-output/video_{int(time.time())}.mp4")
+        download(video_url, out)
+        print(f"[save] {out}", file=sys.stderr)
+
+
+def cmd_r2v(args: argparse.Namespace) -> None:
+    key = resolve_key(args.api_key)
+    media = [{"type": "reference", "url": u} for u in args.reference]
+    body = {
+        "model": args.model,
+        "input": {"prompt": " ".join(args.prompt), "media": media},
+        "parameters": {"resolution": args.resolution, "duration": args.duration,
+                       "watermark": args.watermark},
+    }
+    if args.seed is not None:
+        body["parameters"]["seed"] = args.seed
+    task_id = submit_video(key, body)
+    if args.fire_and_forget:
+        print(task_id)
+        return
+    r = poll_task(key, task_id, interval=args.interval, max_wait=args.max_wait)
+    video_url = r.get("output", {}).get("video_url")
+    if not video_url:
+        sys.exit(f"error: task did not produce video_url: {r}")
+    print(video_url)
+    if not args.no_download:
+        out = args.out or Path(f"maas-output/video_{int(time.time())}.mp4")
+        download(video_url, out)
+        print(f"[save] {out}", file=sys.stderr)
+
+
+def cmd_poll(args: argparse.Namespace) -> None:
+    key = resolve_key(args.api_key)
+    r = poll_task(key, args.task_id, interval=args.interval, max_wait=args.max_wait)
+    print(json.dumps(r, ensure_ascii=False, indent=2))
+    video_url = r.get("output", {}).get("video_url")
+    if video_url and not args.no_download:
+        out = args.out or Path(f"maas-output/video_{args.task_id[:8]}.mp4")
+        download(video_url, out)
+        print(f"[save] {out}", file=sys.stderr)
+
+
+# ---------- cli ---------------------------------------------------------------
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="alibaba-maas",
+        description="Alibaba Bailian Token Plan CLI (image + video).",
+    )
+    p.add_argument("--api-key", help="API key (overrides env/.env)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    # image
+    pi = sub.add_parser("image", help="wan2.7-image / wan2.7-image-pro text-to-image or edit")
+    pi.add_argument("prompt", help="text prompt", nargs="+")
+    pi.add_argument("--model", default=DEFAULT_IMAGE_MODEL,
+                    choices=["wan2.7-image", "wan2.7-image-pro"])
+    pi.add_argument("--image", action="append", default=[],
+                    help="reference image URL(s) for editing; repeatable")
+    pi.add_argument("--size", default="1K", help="1K | 2K | 4K (4K = pro text-only)")
+    pi.add_argument("--n", type=int, default=1, help="1-4 (or 1-12 with --sequential)")
+    pi.add_argument("--sequential", action="store_true", help="group/sequence mode")
+    pi.add_argument("--watermark", action="store_true", help="add AI watermark")
+    pi.add_argument("--no-thinking", action="store_true", help="disable thinking_mode")
+    pi.add_argument("--color-palette", action="append",
+                    help='hex/"ratio%%" pairs, e.g. "#FF0000/25.00%%"; repeatable')
+    pi.add_argument("--seed", type=int)
+    pi.add_argument("--out", type=Path, help="output path (default: auto)")
+    pi.add_argument("--no-download", action="store_true",
+                    help="just print URL, do not download")
+    pi.set_defaults(func=cmd_image)
+
+    # t2v
+    pt = sub.add_parser("t2v", help="happyhorse text-to-video")
+    pt.add_argument("prompt", help="text prompt", nargs="+")
+    pt.add_argument("--model", default=DEFAULT_VIDEO_MODEL)
+    pt.add_argument("--duration", type=int, default=5, help="seconds [3,15]")
+    pt.add_argument("--resolution", default="1080P", choices=["720P", "1080P"])
+    pt.add_argument("--ratio", default=None, help="e.g. 16:9 (t2v only)")
+    pt.add_argument("--watermark", action="store_true", help="add Happy Horse watermark")
+    pt.add_argument("--seed", type=int)
+    pt.add_argument("--interval", type=int, default=15, help="poll interval sec")
+    pt.add_argument("--max-wait", type=int, default=600, help="max wait sec")
+    pt.add_argument("--fire-and-forget", action="store_true",
+                    help="print task_id and exit (use 'poll' later)")
+    pt.add_argument("--out", type=Path)
+    pt.add_argument("--no-download", action="store_true")
+    pt.set_defaults(func=cmd_t2v)
+
+    # i2v
+    pe = sub.add_parser("i2v", help="happyhorse image-to-video (first frame)")
+    pe.add_argument("frame", help="first frame URL (HTTP/HTTPS)")
+    pe.add_argument("prompt", help="text prompt", nargs="+")
+    pe.add_argument("--model", default=DEFAULT_I2V_MODEL)
+    pe.add_argument("--duration", type=int, default=5)
+    pe.add_argument("--resolution", default="1080P", choices=["720P", "1080P"])
+    pe.add_argument("--watermark", action="store_true")
+    pe.add_argument("--seed", type=int)
+    pe.add_argument("--interval", type=int, default=15)
+    pe.add_argument("--max-wait", type=int, default=600)
+    pe.add_argument("--fire-and-forget", action="store_true")
+    pe.add_argument("--out", type=Path)
+    pe.add_argument("--no-download", action="store_true")
+    pe.set_defaults(func=cmd_i2v)
+
+    # r2v
+    pr = sub.add_parser("r2v", help="happyhorse reference-to-video (character consistency)")
+    pr.add_argument("prompt", help="text prompt", nargs="+")
+    pr.add_argument("--reference", nargs="+", required=True,
+                    help="reference image URL(s)")
+    pr.add_argument("--model", default=DEFAULT_R2V_MODEL)
+    pr.add_argument("--duration", type=int, default=5)
+    pr.add_argument("--resolution", default="1080P", choices=["720P", "1080P"])
+    pr.add_argument("--watermark", action="store_true")
+    pr.add_argument("--seed", type=int)
+    pr.add_argument("--interval", type=int, default=15)
+    pr.add_argument("--max-wait", type=int, default=600)
+    pr.add_argument("--fire-and-forget", action="store_true")
+    pr.add_argument("--out", type=Path)
+    pr.add_argument("--no-download", action="store_true")
+    pr.set_defaults(func=cmd_r2v)
+
+    # poll
+    pp = sub.add_parser("poll", help="poll a previously-submitted task")
+    pp.add_argument("task_id")
+    pp.add_argument("--interval", type=int, default=15)
+    pp.add_argument("--max-wait", type=int, default=600)
+    pp.add_argument("--out", type=Path)
+    pp.add_argument("--no-download", action="store_true")
+    pp.set_defaults(func=cmd_poll)
+
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    args.func(args)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
