@@ -42,7 +42,7 @@ The Token Plan key is **not** the same as a regular Bailian API key. The regular
 
 ```bash
 mkdir -p ~/.local/bin
-curl -fsSL https://raw.githubusercontent.com/tmdgusya/omp-alibaba-maas/main/bin/alibaba-maas \
+curl -fsSL https://raw.githubusercontent.com/tmdgusya/omp-alibaba-maas/master/bin/alibaba-maas \
   -o ~/.local/bin/alibaba-maas
 chmod +x ~/.local/bin/alibaba-maas
 ```
@@ -127,7 +127,7 @@ Outputs land in `~/maas-output/`.
 ### One-shot install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/tmdgusya/omp-alibaba-maas/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/tmdgusya/omp-alibaba-maas/master/install.sh | bash
 ```
 
 Then add your API key to `~/.omp/agent/.env` manually (the installer will not prompt for it).
